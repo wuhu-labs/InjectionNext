@@ -133,6 +133,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func setMenuIcon(_ state: InjectionState) {
         DispatchQueue.main.async {
+            guard self.statusItem != nil else { return }
             let tiffName = "Injection"+state.rawValue
             if let path = Bundle.main.path(forResource: tiffName, ofType: "tif"),
                 let image = NSImage(contentsOfFile: path) {
@@ -300,4 +301,183 @@ private extension NSControl.StateValue {
         }
         return self
     }
+}
+
+enum InjectionNextCommandLine {
+    static var isRunning = false
+    static var harness: HeadlessHarness?
+
+    final class HeadlessHarness {
+        let delegate = AppDelegate()
+        let launchXcodeItem = NSMenuItem()
+        let selectXcodeItem = NSMenuItem()
+        let restartDeviceItem = NSMenuItem()
+        let patchCompilerItem = NSMenuItem()
+        let enableDevicesItem = NSMenuItem()
+        let watchDirectoryItem = NSMenuItem()
+        let librariesField = NSTextField(string: Defaults.deviceLibraries)
+        let lastErrorField = NSTextView()
+        let deviceTesting = NSButton(checkboxWithTitle: "Enable devices", target: nil, action: nil)
+        let codeSignBox = NSComboBox()
+
+        init() {
+            delegate.launchXcodeItem = launchXcodeItem
+            delegate.selectXcodeItem = selectXcodeItem
+            delegate.restartDeviceItem = restartDeviceItem
+            delegate.patchCompilerItem = patchCompilerItem
+            delegate.enableDevicesItem = enableDevicesItem
+            delegate.watchDirectoryItem = watchDirectoryItem
+            delegate.librariesField = librariesField
+            delegate.lastErrorField = lastErrorField
+            delegate.deviceTesting = deviceTesting
+            delegate.codeSignBox = codeSignBox
+            enableDevicesItem.state = .off
+            deviceTesting.state = .on
+            codeSignBox.stringValue = Defaults.codesigningIdentity ?? ""
+            AppDelegate.ui = delegate
+        }
+    }
+
+    struct Options {
+        var projectRoot: String?
+        var bazelTarget: String?
+        var xcodeApp: String?
+        var multicast = true
+        var listenAddress = "*" + String(cString: INJECTION_ADDRESS)
+    }
+
+    static func usage(_ executable: String) -> String {
+        """
+        Usage: \(executable) serve [options]
+
+        Starts InjectionNext as a headless hot-reload coordinator. It listens for
+        InjectionNext runtime connections from simulator apps, watches the project
+        directory reported by the app, recompiles changed Swift sources using the
+        Bazel target supplied by INJECTION_BAZEL_TARGET, and injects the resulting
+        dylib back into the running app.
+
+        Options:
+          --project-root <path>   Watch this project immediately, before a client connects.
+          --bazel-target <label>  Cache the Bazel app target used for aquery recompiles.
+          --xcode-app <path>      Xcode.app to use for toolchain and simulator SDK paths.
+          --listen <address>      Listen address, default: *:8887.
+          --no-multicast          Disable the simulator host-locating multicast responder.
+          -h, --help              Show this help.
+        """
+    }
+
+    static func parse(argv: [String]) throws -> Options? {
+        var options = Options()
+        var index = 2
+
+        while index < argv.count {
+            let argument = argv[index]
+            func requireValue() throws -> String {
+                let valueIndex = index + 1
+                guard valueIndex < argv.count else {
+                    throw CommandError("Missing value for \(argument)")
+                }
+                index = valueIndex
+                return argv[valueIndex]
+            }
+
+            switch argument {
+            case "-h", "--help":
+                return nil
+            case "--project-root":
+                options.projectRoot = try requireValue()
+            case "--bazel-target":
+                options.bazelTarget = try requireValue()
+            case "--xcode-app":
+                options.xcodeApp = try requireValue()
+            case "--listen":
+                options.listenAddress = try requireValue()
+            case "--no-multicast":
+                options.multicast = false
+            default:
+                throw CommandError("Unknown argument: \(argument)")
+            }
+            index += 1
+        }
+
+        return options
+    }
+
+    static func inferXcodeApp() -> String? {
+        let developerDir = Popen.system("xcode-select -p")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let developerDir, !developerDir.isEmpty else { return nil }
+        return URL(fileURLWithPath: developerDir)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .path
+    }
+
+    static func run(argc: Int32, argv: UnsafePointer<UnsafePointer<CChar>?>) -> Int32 {
+        let arguments = (0 ..< Int(argc)).compactMap { index in
+            argv[index].map { String(cString: $0) }
+        }
+        let executable = URL(fileURLWithPath: arguments.first ?? "injection-next")
+            .lastPathComponent
+
+        do {
+            guard let options = try parse(argv: arguments) else {
+                print(usage(executable))
+                return 0
+            }
+
+            isRunning = true
+            NSApplication.shared.setActivationPolicy(.prohibited)
+            harness = HeadlessHarness()
+
+            if let xcodeApp = options.xcodeApp ?? inferXcodeApp() {
+                Defaults.xcodeDefault = xcodeApp
+            }
+            Reloader.xcodeDev = Defaults.xcodePath + "/Contents/Developer"
+
+            if let bazelTarget = options.bazelTarget {
+                BazelActionQueryHandler.cachedAppTarget = bazelTarget
+                setenv(INJECTION_BAZEL_TARGET, bazelTarget, 1)
+            }
+
+            if options.multicast {
+                InjectionServer.multicastServe(HOTRELOADING_MULTICAST, port: HOTRELOADING_PORT)
+            }
+            InjectionServer.startServer(options.listenAddress)
+
+            if let projectRoot = options.projectRoot {
+                harness?.delegate.watch(path: projectRoot)
+            }
+
+            print("🔥 InjectionNext CLI listening on \(options.listenAddress)")
+            print("🔥 Xcode: \(Defaults.xcodePath)")
+            if let bazelTarget = options.bazelTarget {
+                print("🔥 Bazel target: \(bazelTarget)")
+            }
+            if let projectRoot = options.projectRoot {
+                print("🔥 Watching: \(projectRoot)")
+            }
+
+            RunLoop.main.run()
+            return 0
+        } catch {
+            fputs("\(error)\n\n\(usage(executable))\n", stderr)
+            return 64
+        }
+    }
+
+    struct CommandError: Error, CustomStringConvertible {
+        var description: String
+        init(_ description: String) {
+            self.description = description
+        }
+    }
+}
+
+@_cdecl("InjectionNextCommandMain")
+public func InjectionNextCommandMain(
+    _ argc: Int32,
+    _ argv: UnsafePointer<UnsafePointer<CChar>?>
+) -> Int32 {
+    InjectionNextCommandLine.run(argc: argc, argv: argv)
 }

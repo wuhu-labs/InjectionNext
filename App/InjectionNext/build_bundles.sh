@@ -6,7 +6,7 @@
 #  Created by John Holdsworth on 22/07/2024.
 #  Copyright © 2024 John Holdsworth. All rights reserved.
 
-FIXED_XCODE_DEVELOPER_PATH=/Applications/Xcode.app/Contents/Developer
+FIXED_XCODE_DEVELOPER_PATH="${DEVELOPER_DIR:-$(xcode-select -p)}"
 export SWIFT_ACTIVE_COMPILATION_CONDITIONS=""
 BUILD=`/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" $CODESIGNING_FOLDER_PATH/Contents/Info.plist`
 

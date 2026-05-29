@@ -11,7 +11,7 @@ PLATFORM=$2
 SDK="$(echo $PLATFORM | tr "[A-Z]" "[a-z]")"
 sleep $3
 
-FIXED_XCODE_DEVELOPER_PATH=/Applications/Xcode.app/Contents/Developer
+FIXED_XCODE_DEVELOPER_PATH="${DEVELOPER_DIR:-$(xcode-select -p)}"
 export SWIFT_ACTIVE_COMPILATION_CONDITIONS=""
 
     SWIFT_DYLIBS_PATH="$FIXED_XCODE_DEVELOPER_PATH/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$SDK"

@@ -45,6 +45,10 @@ class InjectionServer: SimpleSocket {
 
     class func alert(_ msg: String) {
         NSLog("\(APP_PREFIX)\(APP_NAME) \(msg)")
+        if InjectionNextCommandLine.isRunning {
+            print("\(APP_PREFIX)\(APP_NAME) \(msg)")
+            return
+        }
         lastAlert = NSAlert()
         lastAlert?.messageText = "\(self)"
         lastAlert?.informativeText = msg

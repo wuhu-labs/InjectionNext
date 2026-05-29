@@ -8,6 +8,11 @@
 
 #import <Cocoa/Cocoa.h>
 
+extern int InjectionNextCommandMain(int argc, const char * argv[]);
+
 int main(int argc, const char * argv[]) {
+    if (argc > 1 && strcmp(argv[1], "serve") == 0) {
+        return InjectionNextCommandMain(argc, argv);
+    }
     return NSApplicationMain(argc, argv);
 }
