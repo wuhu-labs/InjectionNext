@@ -23,6 +23,7 @@
 
 #if DEBUG || !DEBUG_ONLY
 #include "fishhook.h"
+#include "FishhookProtection.h"
 
 #include <dlfcn.h>
 #include <stdbool.h>
@@ -88,7 +89,18 @@ static int prepend_rebindings(struct rebindings_entry **rebindings_head,
   return 0;
 }
 
-vm_prot_t get_protection(void *sectionStart) {
+static _Thread_local const char *protection_error;
+
+void fishhook_reset_protection_error(void) { protection_error = NULL; }
+const char *fishhook_protection_error(void) { return protection_error; }
+
+static int fail_protection(const char *message) {
+  if (!protection_error) protection_error = message;
+  fprintf(stderr, "fishhook: %s\n", message);
+  return -1;
+}
+
+static bool get_protection(void *sectionStart, vm_prot_t *protection) {
   mach_port_t task = mach_task_self();
   vm_size_t size = 0;
   vm_address_t address = (vm_address_t)sectionStart;
@@ -103,11 +115,13 @@ vm_prot_t get_protection(void *sectionStart) {
   vm_region_basic_info_data_t info;
   kern_return_t info_ret = vm_region(task, &address, &size, VM_REGION_BASIC_INFO, (vm_region_info_t)&info, &count, &object);
 #endif
-  if (info_ret == KERN_SUCCESS) {
-    return info.protection;
-  } else {
-    return VM_PROT_READ;
+  if (info_ret != KERN_SUCCESS) {
+    fail_protection("binding section region lookup failed");
+    return false;
   }
+  if (object != MACH_PORT_NULL) mach_port_deallocate(task, object);
+  *protection = info.protection;
+  return true;
 }
 
 // SwiftTrace additions here
@@ -124,7 +138,7 @@ int rebind_symbols_trace(void * _Nonnull header,
     return rval;
 }// SwiftTrace additions end
 
-static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
+static int perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            section_t *section,
                                            intptr_t slide,
                                            nlist_t *symtab,
@@ -132,12 +146,14 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
                                            uint32_t *indirect_symtab) {
   uint32_t *indirect_symbol_indices = indirect_symtab + section->reserved1;
   void **indirect_symbol_bindings = (void **)((uintptr_t)slide + section->addr);
-  vm_prot_t oldProtection = get_protection(indirect_symbol_bindings);
+  if (section->size == 0) return 0;
+  vm_prot_t oldProtection;
+  if (!get_protection(indirect_symbol_bindings, &oldProtection)) return -1;
   bool needsWriteProtection = (oldProtection & VM_PROT_WRITE) == 0;
   if (needsWriteProtection && vm_protect(mach_task_self(),
       (vm_address_t)indirect_symbol_bindings, section->size, false,
       oldProtection | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
-    return;
+    return fail_protection("binding section write protection failed");
   }
   for (uint i = 0; i < section->size / sizeof(void *); i++) {
     uint32_t symtab_index = indirect_symbol_indices[i];
@@ -187,17 +203,20 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
   symbol_loop:;
   }
   if (needsWriteProtection) {
-    vm_protect(mach_task_self(), (vm_address_t)indirect_symbol_bindings,
-               section->size, false, oldProtection);
+    if (vm_protect(mach_task_self(), (vm_address_t)indirect_symbol_bindings,
+                   section->size, false, oldProtection) != KERN_SUCCESS) {
+      return fail_protection("binding section protection restore failed; patch is not recoverable");
+    }
   }
+  return 0;
 }
 
-static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
+static int rebind_symbols_for_image(struct rebindings_entry *rebindings,
                                      const struct mach_header *header,
                                      intptr_t slide) {
   Dl_info info;
   if (dladdr(header, &info) == 0) {
-    return;
+    return 0;
   }
 
   segment_command_t *cur_seg_cmd;
@@ -221,7 +240,7 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
 
   if (!symtab_cmd || !dysymtab_cmd || !linkedit_segment ||
       !dysymtab_cmd->nindirectsyms) {
-    return;
+    return 0;
   }
 
   // Find base symbol/string table addresses
@@ -244,14 +263,15 @@ static void rebind_symbols_for_image(struct rebindings_entry *rebindings,
         section_t *sect =
           (section_t *)(cur + sizeof(segment_command_t)) + j;
         if ((sect->flags & SECTION_TYPE) == S_LAZY_SYMBOL_POINTERS) {
-          perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
+          if (perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab) != 0) return -1;
         }
         if ((sect->flags & SECTION_TYPE) == S_NON_LAZY_SYMBOL_POINTERS) {
-          perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab);
+          if (perform_rebinding_with_section(rebindings, sect, slide, symtab, strtab, indirect_symtab) != 0) return -1;
         }
       }
     }
   }
+  return 0;
 }
 
 static void _rebind_symbols_for_image(const struct mach_header *header,
@@ -265,7 +285,7 @@ int rebind_symbols_image(void *header,
                          size_t rebindings_nel) {
     struct rebindings_entry *rebindings_head = NULL;
     int retval = prepend_rebindings(&rebindings_head, rebindings, rebindings_nel);
-    rebind_symbols_for_image(rebindings_head, (const struct mach_header *) header, slide);
+    if (rebind_symbols_for_image(rebindings_head, (const struct mach_header *) header, slide) != 0) retval = -1;
     if (rebindings_head) {
       free(rebindings_head->rebindings);
     }
