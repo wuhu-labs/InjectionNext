@@ -25,6 +25,7 @@ let package = Package(
             swiftSettings: [.define("DEBUG_ONLY")]),
         .target(
             name: "InjectionNextC",
+            exclude: ["SwiftTraceGuts/fishhook.c"],
             cSettings: [.define("DEBUG_ONLY"), .define("FISHHOOK_EXPORT")]),
         .testTarget(
             name: "InjectionNextTests",
